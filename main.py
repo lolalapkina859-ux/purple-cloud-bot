@@ -68,6 +68,7 @@ def get_klines(symbol, limit=250):
 
 def get_contract(symbol):
     data=public_get('/openApi/swap/v2/quote/contracts',{'symbol':format_symbol(symbol)}) or []
+    if isinstance(data,dict): data=data.get('contracts',data.get('data',[data]))
     if isinstance(data,dict): data=[data]
     fs=format_symbol(symbol)
     c=next((x for x in data if x.get('symbol')==fs),None)
@@ -92,15 +93,31 @@ def live_position(symbol, side=None):
     return found
 
 
+def is_isolated(p):
+    v=p.get('isolated',False)
+    if isinstance(v,bool): return v
+    return str(v).strip().lower() in ('true','1','yes')
+
+
+def ensure_hedge_mode():
+    data=signed_get('/openApi/swap/v1/positionSide/dual') or {}
+    dual=data.get('dualSidePosition') if isinstance(data,dict) else None
+    if isinstance(dual,str): dual=dual.lower()=='true'
+    if dual is not True: raise RuntimeError('BingX account is not in Hedge Mode; live trading aborted')
+
+
 def set_cross_and_leverage(symbol):
     fs=format_symbol(symbol)
-    try: signed_post('/openApi/swap/v2/trade/marginType',{'symbol':fs,'marginType':'CROSSED'})
-    except Exception as e:
-        # BingX may reject a no-op change while an existing position is open; verify via position data later.
-        print(f'[PC LIVE] {fs} marginType note: {e}')
-    for side in ('LONG','SHORT'):
-        try: signed_post('/openApi/swap/v2/trade/leverage',{'symbol':fs,'side':side,'leverage':LEVERAGE})
-        except Exception as e: print(f'[PC LIVE] {fs} leverage {side} note: {e}')
+    mt=signed_get('/openApi/swap/v2/trade/marginType',{'symbol':fs}) or {}
+    current=str(mt.get('marginType','')).upper() if isinstance(mt,dict) else ''
+    if current!='CROSSED':
+        signed_post('/openApi/swap/v2/trade/marginType',{'symbol':fs,'marginType':'CROSSED'})
+    lev=signed_get('/openApi/swap/v2/trade/leverage',{'symbol':fs}) or {}
+    for side,key in (('LONG','longLeverage'),('SHORT','shortLeverage')):
+        try: current_lev=int(float(lev.get(key,0) or 0))
+        except Exception: current_lev=0
+        if current_lev!=LEVERAGE:
+            signed_post('/openApi/swap/v2/trade/leverage',{'symbol':fs,'side':side,'leverage':LEVERAGE})
 
 
 def order_qty(symbol, price):
@@ -113,13 +130,14 @@ def order_qty(symbol, price):
 
 
 def place_market(symbol, position_side, quantity, opening):
-    fs=format_symbol(symbol)
+    fs=format_symbol(symbol); q=abs(float(quantity))
+    if q<=0: raise RuntimeError('order quantity <= 0')
     side=('BUY' if position_side=='LONG' else 'SELL') if opening else ('SELL' if position_side=='LONG' else 'BUY')
     cid=f"pc-{symbol.lower()}-{position_side.lower()}-{'o' if opening else 'c'}-{int(time.time()*1000)}"[:40]
-    return signed_post('/openApi/swap/v2/trade/order',{'symbol':fs,'side':side,'positionSide':position_side,'type':'MARKET','quantity':quantity,'clientOrderId':cid})
+    return signed_post('/openApi/swap/v2/trade/order',{'symbol':fs,'side':side,'positionSide':position_side,'type':'MARKET','quantity':format(q,'.12g'),'clientOrderId':cid})
 
 
-def wait_side_flat(symbol, side, seconds=12):
+def wait_side_flat(symbol, side, seconds=15):
     end=time.time()+seconds
     while time.time()<end:
         if not live_position(symbol,side): return True
@@ -127,8 +145,17 @@ def wait_side_flat(symbol, side, seconds=12):
     return False
 
 
+def available_usdt():
+    bal=signed_get('/openApi/swap/v3/user/balance') or []
+    if isinstance(bal,dict): bal=bal.get('balance',bal.get('data',bal))
+    if isinstance(bal,list): b=next((x for x in bal if x.get('asset')=='USDT'),{})
+    else: b=bal if isinstance(bal,dict) else {}
+    return float(b.get('availableMargin',b.get('availableBalance',0)) or 0)
+
+
 def verify_account():
     print('[PC API] Account verification starting; orders only possible when PAPER=False AND live confirmation is set.')
+    ensure_hedge_mode()
     bal=signed_get('/openApi/swap/v3/user/balance') or []
     if isinstance(bal,dict): bal=bal.get('balance',bal.get('data',bal))
     if isinstance(bal,list): b=next((x for x in bal if x.get('asset')=='USDT'),bal[0] if bal else {})
@@ -139,7 +166,7 @@ def verify_account():
         try: amt=abs(float(p.get('positionAmt',0) or 0))
         except Exception: amt=0
         if amt>0: opened.append(f"{p.get('symbol')}:{p.get('positionSide')}:{amt}")
-    print(f"[PC API] POSITIONS OK | open={len(opened)}"+(f" | {'; '.join(opened[:20])}" if opened else ''))
+    print(f"[PC API] HEDGE MODE OK | POSITIONS OK | open={len(opened)}"+(f" | {'; '.join(opened[:20])}" if opened else ''))
 
 
 def rma(s,n): return s.ewm(alpha=1/n,adjust=False).mean()
@@ -165,7 +192,6 @@ def load_state():
         if STATE_PATH.exists(): return json.loads(STATE_PATH.read_text())
     except Exception as e: print('[PC] state read error:',e)
     return {'positions':{},'last_signal_candle':{},'events':[]}
-
 def save_state(st):
     STATE_PATH.parent.mkdir(parents=True,exist_ok=True); tmp=STATE_PATH.with_suffix('.tmp'); tmp.write_text(json.dumps(st,indent=2)); tmp.replace(STATE_PATH)
 def emit(st,symbol,action,side,price,candle,note=''):
@@ -177,18 +203,20 @@ def emit(st,symbol,action,side,price,candle,note=''):
 def execute_live(st,symbol,signal,price,candle):
     if not LIVE_CONFIRM:
         emit(st,symbol,'LIVE_BLOCKED',signal,price,candle,'PC_LIVE_CONFIRM guard not enabled'); return
+    ensure_hedge_mode()
     opposite='SHORT' if signal=='LONG' else 'LONG'
     same=live_position(symbol,signal); opp=live_position(symbol,opposite)
     if same and not opp:
         emit(st,symbol,'IGNORE_SAME_SIDE',signal,price,candle,'exchange position already matches signal'); return
     for p,amt in opp:
-        qty=str(p.get('availableAmt') or p.get('positionAmt') or amt)
-        place_market(symbol,opposite,qty,False)
-        emit(st,symbol,'CLOSE_SENT',opposite,price,candle,f'qty={qty}')
+        place_market(symbol,opposite,amt,False)
+        emit(st,symbol,'CLOSE_SENT',opposite,price,candle,f'qty={amt}')
     if opp and not wait_side_flat(symbol,opposite):
         raise RuntimeError(f'{opposite} did not close; reverse aborted')
     if live_position(symbol,signal):
         emit(st,symbol,'IGNORE_SAME_SIDE',signal,price,candle,'matching exchange position remains'); return
+    if available_usdt() < (NOTIONAL_USDT/LEVERAGE)*1.10:
+        raise RuntimeError('insufficient available margin for configured notional/leverage')
     set_cross_and_leverage(symbol)
     qty=order_qty(symbol,price)
     place_market(symbol,signal,qty,True)
@@ -196,10 +224,10 @@ def execute_live(st,symbol,signal,price,candle):
     actual=live_position(symbol,signal)
     if not actual: raise RuntimeError('open order sent but position not confirmed')
     p,_=actual[0]
-    if bool(p.get('isolated',False)): raise RuntimeError('position opened ISOLATED, expected CROSS')
+    if is_isolated(p): raise RuntimeError('position opened ISOLATED, expected CROSS')
     lev=int(float(p.get('leverage',0) or 0))
     if lev!=LEVERAGE: print(f'[PC LIVE] WARNING {format_symbol(symbol)} exchange leverage={lev}, requested={LEVERAGE}')
-    emit(st,symbol,'OPEN_CONFIRMED',signal,float(p.get('avgPrice',price) or price),candle,f"qty={p.get('positionAmt')} cross={not bool(p.get('isolated',False))} leverage={lev}")
+    emit(st,symbol,'OPEN_CONFIRMED',signal,float(p.get('avgPrice',price) or price),candle,f"qty={abs(float(p.get('positionAmt',0) or 0))} cross=True leverage={lev}")
 
 
 def process_symbol(st,symbol):
@@ -208,7 +236,6 @@ def process_symbol(st,symbol):
     pc=purple_cloud(closed); row=pc.iloc[-1]; candle=closed.iloc[-1].time.isoformat(); price=float(closed.iloc[-1].close)
     signal='LONG' if bool(row.pc_buy) else ('SHORT' if bool(row.pc_sell) else None)
     if not signal or st['last_signal_candle'].get(symbol)==candle: return
-    # Persist signal id BEFORE any live action. A restart cannot blindly replay the same candle.
     st['last_signal_candle'][symbol]=candle; save_state(st)
     if not PAPER:
         execute_live(st,symbol,signal,price,candle); return
