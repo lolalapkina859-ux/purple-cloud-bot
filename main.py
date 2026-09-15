@@ -1,12 +1,15 @@
 from __future__ import annotations
-import json, os, time
+import hashlib, hmac, json, os, time
 from pathlib import Path
 from datetime import datetime, timezone
+from urllib.parse import urlencode
 import numpy as np
 import pandas as pd
 import requests
 
 BINGX_BASE_URL = "https://open-api.bingx.com"
+BINGX_API_KEY = os.getenv('BINGX_API_KEY', '')
+BINGX_SECRET_KEY = os.getenv('BINGX_SECRET_KEY', '')
 SYMBOLS = ['ZECUSDT','USELESSUSDT','FETUSDT','HYPEUSDT','JTOUSDT','VETUSDT','XRPUSDT','ETHUSDT','UNIUSDT','INJUSDT','SEIUSDT','1000SHIBUSDT','DYDXUSDT']
 INTERVAL = '30m'
 NOTIONAL_USDT = float(os.getenv('PC_NOTIONAL_USDT', '60'))
@@ -39,6 +42,44 @@ def get_klines(symbol, limit=250):
     for c in ['open','high','low','close','volume']: d[c]=pd.to_numeric(d[c],errors='coerce')
     d['time']=pd.to_datetime(pd.to_numeric(d['time'],errors='coerce'),unit='ms',utc=True)
     return d.dropna().sort_values('time').drop_duplicates('time').reset_index(drop=True)
+
+
+def signed_get(path, params=None):
+    if not BINGX_API_KEY or not BINGX_SECRET_KEY:
+        raise RuntimeError('BINGX_API_KEY/BINGX_SECRET_KEY missing')
+    p=dict(params or {}); p['timestamp']=int(time.time()*1000)
+    query=urlencode(sorted(p.items()))
+    sig=hmac.new(BINGX_SECRET_KEY.encode(),query.encode(),hashlib.sha256).hexdigest()
+    r=requests.get(f'{BINGX_BASE_URL}{path}?{query}&signature={sig}',headers={'X-BX-APIKEY':BINGX_API_KEY,'User-Agent':'PurpleCloudBot'},timeout=20)
+    r.raise_for_status(); data=r.json()
+    if data.get('code') not in (0,'0',None): raise RuntimeError(f"BingX {data.get('code')}: {data.get('msg')}")
+    return data.get('data')
+
+
+def verify_account_read_only():
+    print('[PC API] Read-only account verification starting; NO orders will be sent.')
+    if not BINGX_API_KEY or not BINGX_SECRET_KEY:
+        print('[PC API] SKIP: BingX API credentials are not configured.')
+        return
+    try:
+        bal=signed_get('/openApi/swap/v2/user/balance') or {}
+        b=bal.get('balance',bal) if isinstance(bal,dict) else bal
+        asset=b.get('asset','USDT') if isinstance(b,dict) else 'USDT'
+        available=b.get('availableMargin',b.get('availableBalance','?')) if isinstance(b,dict) else '?'
+        equity=b.get('equity',b.get('balance','?')) if isinstance(b,dict) else '?'
+        print(f'[PC API] BALANCE OK | asset={asset} | equity={equity} | available={available}')
+        pos=signed_get('/openApi/swap/v2/user/positions') or []
+        if isinstance(pos,dict): pos=pos.get('positions',pos.get('data',[]))
+        opened=[]
+        for p in pos if isinstance(pos,list) else []:
+            try:
+                amt=float(p.get('positionAmt',p.get('positionAmount',0)) or 0)
+                if abs(amt)>0: opened.append(f"{p.get('symbol','?')}:{p.get('positionSide',p.get('side','?'))}:{amt}")
+            except Exception: pass
+        print(f'[PC API] POSITIONS OK | open={len(opened)}' + (f" | {'; '.join(opened[:20])}" if opened else ''))
+        print('[PC API] VERIFIED: credentials can read BingX account. Trading remains blocked while PAPER=True.')
+    except Exception as e:
+        print(f'[PC API] VERIFY FAILED: {type(e).__name__}: {e}')
 
 
 def rma(s,n): return s.ewm(alpha=1/n,adjust=False).mean()
@@ -101,6 +142,7 @@ def process_symbol(st,symbol):
 
 def main():
     print(f'[PC] NORMAL 30M | {len(SYMBOLS)} symbols | ${NOTIONAL_USDT} notional | {LEVERAGE}x | PAPER={PAPER}')
+    verify_account_read_only()
     while True:
         st=load_state()
         for symbol in SYMBOLS:
