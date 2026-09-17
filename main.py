@@ -10,7 +10,7 @@ import requests
 BINGX_BASE_URL = "https://open-api.bingx.com"
 BINGX_API_KEY = os.getenv('BINGX_API_KEY', '')
 BINGX_SECRET_KEY = os.getenv('BINGX_SECRET_KEY', '')
-SYMBOLS = ['ZECUSDT','USELESSUSDT','FETUSDT','HYPEUSDT','JTOUSDT','VETUSDT','XRPUSDT','ETHUSDT','UNIUSDT','INJUSDT','SEIUSDT','1000SHIBUSDT','DYDXUSDT']
+SYMBOLS = ['ZECUSDT','USELESSUSDT','FETUSDT','HYPEUSDT','JTOUSDT','VETUSDT','XRPUSDT','ETHUSDT','UNIUSDT','INJUSDT','SEIUSDT','1000SHIBUSDT','DYDXUSDT','NEARUSDT']
 INTERVAL = '30m'
 NOTIONAL_USDT = float(os.getenv('PC_NOTIONAL_USDT', '60'))
 LEVERAGE = int(os.getenv('PC_LEVERAGE', '20'))
@@ -249,15 +249,13 @@ def process_symbol(st,symbol):
 def main():
     mode='PAPER' if PAPER else ('LIVE' if LIVE_CONFIRM else 'LIVE_BLOCKED')
     print(f'[PC] NORMAL 30M | {len(SYMBOLS)} symbols | ${NOTIONAL_USDT} notional | {LEVERAGE}x | MODE={mode}')
-    try: verify_account()
-    except Exception as e: print(f'[PC API] VERIFY FAILED: {type(e).__name__}: {e}')
-    if not PAPER and not LIVE_CONFIRM: print('[PC SAFETY] PC_PAPER=false but live confirmation is missing: NO orders will be sent.')
+    if not PAPER: verify_account()
+    st=load_state()
     while True:
-        st=load_state()
-        for symbol in SYMBOLS:
-            try: process_symbol(st,symbol)
-            except Exception as e: print('[PC]',symbol,'error:',type(e).__name__,e)
-            save_state(st)
-        time.sleep(SCAN_SECONDS)
+        for s in SYMBOLS:
+            try: process_symbol(st,s)
+            except Exception as e: print(f'[PC] {s} error: {e}')
+        save_state(st); time.sleep(SCAN_SECONDS)
 
-if __name__=='__main__': main()
+if __name__=='__main__':
+    main()
