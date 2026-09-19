@@ -1,5 +1,5 @@
 from __future__ import annotations
-import hashlib, hmac, json, math, os, time
+import csv, hashlib, hmac, json, math, os, time
 from pathlib import Path
 from datetime import datetime, timezone
 from urllib.parse import urlencode
@@ -17,6 +17,7 @@ LEVERAGE = int(os.getenv('PC_LEVERAGE', '20'))
 PAPER = os.getenv('PC_PAPER', 'true').lower() == 'true'
 LIVE_CONFIRM = os.getenv('PC_LIVE_CONFIRM', '') == 'I_UNDERSTAND_LIVE_TRADING'
 STATE_PATH = Path(os.getenv('PC_STATE_PATH', '/data/purple_cloud_state.json'))
+JOURNAL_PATH = Path(os.getenv('PC_JOURNAL_PATH', '/data/trade_journal.csv'))
 SCAN_SECONDS = int(os.getenv('PC_SCAN_SECONDS', '60'))
 PERIOD = 20
 ALPHA = 1.5
@@ -200,6 +201,24 @@ def emit(st,symbol,action,side,price,candle,note=''):
     st['events'].append(ev); st['events']=st['events'][-1000:]; print('[PC EVENT]',json.dumps(ev))
 
 
+def journal_trade(symbol,side,entry_time,entry_price,exit_time,exit_price,notional,qty='',source='LIVE'):
+    try:
+        entry_price=float(entry_price); exit_price=float(exit_price); notional=float(notional)
+        ret=(exit_price/entry_price-1) if side=='LONG' else (entry_price/exit_price-1)
+        try:
+            duration_hours=(pd.Timestamp(exit_time)-pd.Timestamp(entry_time)).total_seconds()/3600
+        except Exception: duration_hours=''
+        row={'symbol':symbol,'side':side,'entry_time':entry_time,'entry_price':entry_price,'exit_time':exit_time,'exit_price':exit_price,
+             'pnl_usdt_est':notional*ret,'return_pct':ret*100,'duration_hours':duration_hours,'notional_usdt':notional,'qty':qty,'source':source}
+        JOURNAL_PATH.parent.mkdir(parents=True,exist_ok=True); exists=JOURNAL_PATH.exists()
+        with JOURNAL_PATH.open('a',newline='') as fh:
+            w=csv.DictWriter(fh,fieldnames=list(row));
+            if not exists: w.writeheader()
+            w.writerow(row)
+        print('[PC JOURNAL]',json.dumps(row))
+    except Exception as e: print('[PC JOURNAL] write error:',e)
+
+
 def execute_live(st,symbol,signal,price,candle):
     if not LIVE_CONFIRM:
         emit(st,symbol,'LIVE_BLOCKED',signal,price,candle,'PC_LIVE_CONFIRM guard not enabled'); return
@@ -209,8 +228,11 @@ def execute_live(st,symbol,signal,price,candle):
     if same and not opp:
         emit(st,symbol,'IGNORE_SAME_SIDE',signal,price,candle,'exchange position already matches signal'); return
     for p,amt in opp:
+        entry_px=float(p.get('avgPrice',0) or 0); entry_time=p.get('updateTime') or p.get('createTime') or ''
         place_market(symbol,opposite,amt,False)
         emit(st,symbol,'CLOSE_SENT',opposite,price,candle,f'qty={amt}')
+        if entry_px>0:
+            journal_trade(symbol,opposite,entry_time,entry_px,candle,price,NOTIONAL_USDT,amt,'LIVE')
     if opp and not wait_side_flat(symbol,opposite):
         raise RuntimeError(f'{opposite} did not close; reverse aborted')
     if live_position(symbol,signal):
@@ -227,7 +249,9 @@ def execute_live(st,symbol,signal,price,candle):
     if is_isolated(p): raise RuntimeError('position opened ISOLATED, expected CROSS')
     lev=int(float(p.get('leverage',0) or 0))
     if lev!=LEVERAGE: print(f'[PC LIVE] WARNING {format_symbol(symbol)} exchange leverage={lev}, requested={LEVERAGE}')
-    emit(st,symbol,'OPEN_CONFIRMED',signal,float(p.get('avgPrice',price) or price),candle,f"qty={abs(float(p.get('positionAmt',0) or 0))} cross=True leverage={lev}")
+    open_px=float(p.get('avgPrice',price) or price); open_qty=abs(float(p.get('positionAmt',0) or 0))
+    st['positions'][symbol]={'side':signal,'entry':open_px,'opened_candle':candle,'notional_usdt':NOTIONAL_USDT,'qty':open_qty,'leverage':LEVERAGE}
+    emit(st,symbol,'OPEN_CONFIRMED',signal,open_px,candle,f"qty={open_qty} cross=True leverage={lev}")
 
 
 def process_symbol(st,symbol):
@@ -238,6 +262,10 @@ def process_symbol(st,symbol):
     if not signal or st['last_signal_candle'].get(symbol)==candle: return
     st['last_signal_candle'][symbol]=candle; save_state(st)
     if not PAPER:
+        old=st.get('positions',{}).get(symbol)
+        if old and old.get('side')!=signal:
+            journal_trade(symbol,old['side'],old.get('opened_candle',''),old.get('entry',price),candle,price,old.get('notional_usdt',NOTIONAL_USDT),old.get('qty',''),'LIVE_STATE')
+            st['positions'].pop(symbol,None)
         execute_live(st,symbol,signal,price,candle); return
     old=st['positions'].get(symbol)
     if old and old['side']==signal: emit(st,symbol,'IGNORE_SAME_SIDE',signal,price,candle); return
