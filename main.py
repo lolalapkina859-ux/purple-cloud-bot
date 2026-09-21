@@ -14,6 +14,10 @@ SYMBOLS = ['ZECUSDT','USELESSUSDT','FETUSDT','HYPEUSDT','JTOUSDT','VETUSDT','XRP
 INTERVAL = '30m'
 NOTIONAL_USDT = float(os.getenv('PC_NOTIONAL_USDT', '60'))
 LEVERAGE = int(os.getenv('PC_LEVERAGE', '20'))
+SYMBOL_LEVERAGE = {'FLOWUSDT': 10}
+
+def leverage_for(symbol):
+    return min(LEVERAGE, SYMBOL_LEVERAGE.get(symbol.upper(), LEVERAGE))
 PAPER = os.getenv('PC_PAPER', 'true').lower() == 'true'
 LIVE_CONFIRM = os.getenv('PC_LIVE_CONFIRM', '') == 'I_UNDERSTAND_LIVE_TRADING'
 STATE_PATH = Path(os.getenv('PC_STATE_PATH', '/data/purple_cloud_state.json'))
@@ -109,6 +113,7 @@ def ensure_hedge_mode():
 
 def set_cross_and_leverage(symbol):
     fs=format_symbol(symbol)
+    target_leverage=leverage_for(symbol)
     mt=signed_get('/openApi/swap/v2/trade/marginType',{'symbol':fs}) or {}
     current=str(mt.get('marginType','')).upper() if isinstance(mt,dict) else ''
     if current!='CROSSED':
@@ -117,8 +122,8 @@ def set_cross_and_leverage(symbol):
     for side,key in (('LONG','longLeverage'),('SHORT','shortLeverage')):
         try: current_lev=int(float(lev.get(key,0) or 0))
         except Exception: current_lev=0
-        if current_lev!=LEVERAGE:
-            signed_post('/openApi/swap/v2/trade/leverage',{'symbol':fs,'side':side,'leverage':LEVERAGE})
+        if current_lev!=target_leverage:
+            signed_post('/openApi/swap/v2/trade/leverage',{'symbol':fs,'side':side,'leverage':target_leverage})
 
 
 def order_qty(symbol, price):
@@ -237,7 +242,8 @@ def execute_live(st,symbol,signal,price,candle):
         raise RuntimeError(f'{opposite} did not close; reverse aborted')
     if live_position(symbol,signal):
         emit(st,symbol,'IGNORE_SAME_SIDE',signal,price,candle,'matching exchange position remains'); return
-    if available_usdt() < (NOTIONAL_USDT/LEVERAGE)*1.10:
+    target_leverage=leverage_for(symbol)
+    if available_usdt() < (NOTIONAL_USDT/target_leverage)*1.10:
         raise RuntimeError('insufficient available margin for configured notional/leverage')
     set_cross_and_leverage(symbol)
     qty=order_qty(symbol,price)
@@ -248,9 +254,9 @@ def execute_live(st,symbol,signal,price,candle):
     p,_=actual[0]
     if is_isolated(p): raise RuntimeError('position opened ISOLATED, expected CROSS')
     lev=int(float(p.get('leverage',0) or 0))
-    if lev!=LEVERAGE: print(f'[PC LIVE] WARNING {format_symbol(symbol)} exchange leverage={lev}, requested={LEVERAGE}')
+    if lev!=target_leverage: print(f'[PC LIVE] WARNING {format_symbol(symbol)} exchange leverage={lev}, requested={target_leverage}')
     open_px=float(p.get('avgPrice',price) or price); open_qty=abs(float(p.get('positionAmt',0) or 0))
-    st['positions'][symbol]={'side':signal,'entry':open_px,'opened_candle':candle,'notional_usdt':NOTIONAL_USDT,'qty':open_qty,'leverage':LEVERAGE}
+    st['positions'][symbol]={'side':signal,'entry':open_px,'opened_candle':candle,'notional_usdt':NOTIONAL_USDT,'qty':open_qty,'leverage':target_leverage}
     emit(st,symbol,'OPEN_CONFIRMED',signal,open_px,candle,f"qty={open_qty} cross=True leverage={lev}")
 
 
