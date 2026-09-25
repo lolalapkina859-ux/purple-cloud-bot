@@ -151,22 +151,34 @@ def wait_side_flat(symbol, side, seconds=15):
     return False
 
 
+def balance_record():
+    """Return the USDT futures balance record without confusing numeric 'balance' with a nested object."""
+    raw=signed_get('/openApi/swap/v3/user/balance') or {}
+    data=raw
+    # Some API/wrapper variants may nest the record under data/balance.
+    # Only unwrap when the nested value is itself a dict/list.
+    if isinstance(data,dict) and isinstance(data.get('data'),(dict,list)):
+        data=data['data']
+    if isinstance(data,dict) and isinstance(data.get('balance'),(dict,list)):
+        data=data['balance']
+    if isinstance(data,list):
+        return next((x for x in data if isinstance(x,dict) and x.get('asset')=='USDT'), data[0] if data and isinstance(data[0],dict) else {})
+    return data if isinstance(data,dict) else {}
+
+
 def available_usdt():
-    bal=signed_get('/openApi/swap/v3/user/balance') or []
-    if isinstance(bal,dict): bal=bal.get('balance',bal.get('data',bal))
-    if isinstance(bal,list): b=next((x for x in bal if x.get('asset')=='USDT'),{})
-    else: b=bal if isinstance(bal,dict) else {}
-    return float(b.get('availableMargin',b.get('availableBalance',0)) or 0)
+    b=balance_record()
+    value=b.get('availableMargin',b.get('availableBalance'))
+    if value is None:
+        raise RuntimeError(f"balance response missing available margin; keys={sorted(b.keys())}")
+    return float(value)
 
 
 def verify_account():
     print('[PC API] Account verification starting; orders only possible when PAPER=False AND live confirmation is set.')
     ensure_hedge_mode()
-    bal=signed_get('/openApi/swap/v3/user/balance') or []
-    if isinstance(bal,dict): bal=bal.get('balance',bal.get('data',bal))
-    if isinstance(bal,list): b=next((x for x in bal if x.get('asset')=='USDT'),bal[0] if bal else {})
-    else: b=bal if isinstance(bal,dict) else {}
-    print(f"[PC API] BALANCE OK | asset={b.get('asset','USDT')} | equity={b.get('equity',b.get('balance','?'))} | available={b.get('availableMargin',b.get('availableBalance','?'))}")
+    b=balance_record()
+    print(f"[PC API] BALANCE OK | asset={b.get('asset','USDT')} | balance={b.get('balance','?')} | equity={b.get('equity','?')} | available={b.get('availableMargin',b.get('availableBalance','?'))} | used={b.get('usedMargin','?')} | frozen={b.get('frozenMargin',b.get('freezedMargin','?'))}")
     opened=[]
     for p in get_positions():
         try: amt=abs(float(p.get('positionAmt',0) or 0))
@@ -243,8 +255,11 @@ def execute_live(st,symbol,signal,price,candle):
     if live_position(symbol,signal):
         emit(st,symbol,'IGNORE_SAME_SIDE',signal,price,candle,'matching exchange position remains'); return
     target_leverage=leverage_for(symbol)
-    if available_usdt() < (NOTIONAL_USDT/target_leverage)*1.10:
-        raise RuntimeError('insufficient available margin for configured notional/leverage')
+    available=available_usdt()
+    required=(NOTIONAL_USDT/target_leverage)*1.10
+    print(f'[PC MARGIN] {symbol} available={available:.4f} required={required:.4f} notional={NOTIONAL_USDT:.2f} leverage={target_leverage}x')
+    if available < required:
+        raise RuntimeError(f'insufficient available margin: available={available:.4f}, required={required:.4f}, leverage={target_leverage}x')
     set_cross_and_leverage(symbol)
     qty=order_qty(symbol,price)
     place_market(symbol,signal,qty,True)
